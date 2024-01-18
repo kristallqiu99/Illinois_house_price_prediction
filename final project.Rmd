@@ -1,0 +1,1067 @@
+---
+title: 'FIN 550 Final Project: Property Assessment'
+author: "Irene Ye"
+date: "2023-11-29"
+output:
+  bookdown::html_document2:
+      self_contained: yes
+      # toc: yes
+      number_sections: yes
+      df_print: paged
+      warning: false
+---
+
+The total runtime of the code is 8.374089 mins.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# record code start time
+start_time <- Sys.time()
+
+# install.packages("kableExtra")
+# install.packages('haven')
+# install.packages('dplyr')
+# install.packages('tidyverse')
+# install.packages('estimatr')
+# install.packages('gridExtra')
+# install.packages("qqplotr")
+# install.packages("reshape2")
+# install.packages("corrplot")
+# install.packages("caret")
+# install.packages("glmnet")
+# install.packages("randomForest")
+# install.packages("lightgbm")
+# install.packages("gbm")
+# install.packages("tidymodels")
+# install.packages("ranger")
+# install.packages("bonsai")
+library(haven)
+library(dplyr)
+library(tidyverse)
+library(estimatr)
+library(kableExtra)
+library(ggplot2)
+library(qqplotr)
+library(gridExtra)
+library(grid)
+library(reshape2)
+library(corrplot)
+library(RColorBrewer)
+library(caret)
+library(glmnet)
+library(rpart)
+library(randomForest)
+library(gbm)
+library(lightgbm)
+library(tidymodels)
+library(ranger)
+library(parallel)
+library(doParallel)
+library(bonsai)
+library(MASS)
+```
+
+# Historic Property Prices Dataset
+```{r read data}
+# read historic data
+df <- read.csv("historic_property_data.csv")
+head(df)
+```
+
+```{r data shape}
+print(paste("Number of records: ", nrow(df)))
+print(paste("Number of features: ", ncol(df)-1))
+```
+
+```{r attribuets names}
+colnames(df)
+```
+
+```{r data summary}
+# summary of data
+data.frame(unclass(summary(df)), check.names = F, stringsAsFactors = F)
+```
+
+# Data Preprocessing
+## Sale Price Analysis
+```{r fig.height=3, fig.width=8}
+grid.arrange(
+  # plot sale_price distribution
+  ggplot(df, aes(x = sale_price)) +
+    geom_histogram(
+      aes(y = after_stat(density)),
+      colour = 1,
+      fill = "white",
+      bins = 60
+    ) +
+    geom_density(
+      lwd = 1,
+      colour = 4,
+      fill = 4,
+      alpha = 0.25
+    ) +
+    ggtitle("Histogram of Sale Price"),
+  
+  # normality plot
+  ggplot(mapping = aes(sample = df$sale_price)) +
+    stat_qq_point(size = 2, color = "blue") +
+    stat_qq_line(color = "red") +
+    xlab("x-axis") +
+    ylab("y-axis") +
+    ggtitle("Normality Plot"),
+  nrow = 1
+)
+
+```
+
+From the chart above, `sale_price` is severely right skewed. Most of the properties are less than \$1.1M, but there are few pricey properties over \$5M+.
+```{r}
+# take log of sale_price to see how it distributes
+grid.arrange(
+  df %>%
+    ggplot(aes(x = log1p(sale_price))) +
+    geom_histogram(
+      aes(y = ..density..),
+      colour = 1,
+      fill = "white",
+      bins = 60
+    ) +
+    geom_density(
+      lwd = 1,
+      colour = 4,
+      fill = 4,
+      alpha = 0.25
+    ) +
+    ggtitle("Histogram of log(Sale Price)"),
+  
+  df %>%
+    ggplot(mapping = aes(sample = log1p(sale_price))) +
+    stat_qq_point(size = 2, color = "blue") +
+    stat_qq_line(color = "red") +
+    xlab("x-axis") +
+    ylab("y-axis") +
+    ggtitle("Normality Plot"),
+  nrow = 1
+)
+```
+
+After the log transformation of `sale_price`, it now becomes slightly left skewed, which indicates log might not be a good fit.
+
+```{r box cox}
+# fit box-cox transformation to find optimal lambda
+bc_transform <- boxcox(df$sale_price ~ 1, plot = FALSE)
+lambda <- bc_transform$x[which.max(bc_transform$y)]
+
+# define a function to transform the data
+boxcox_trans <- function(y) {
+  return ((y ^ lambda - 1) / lambda)
+}
+
+# define a function to get the original data
+boxcox_inv <- function(y) {
+  return ((y * lambda + 1) ^ (1 / lambda))
+}
+
+grid.arrange(
+  ggplot(data = df, aes(x = boxcox_trans(sale_price))) +
+    geom_histogram(
+      aes(x = boxcox_trans(sale_price), y = ..density..),
+      colour = 1,
+      fill = "white",
+      bins = 60
+    ) +
+    geom_density(
+      lwd = 1,
+      colour = 4,
+      fill = 4,
+      alpha = 0.25
+    ) +
+    ggtitle("Histogram of boxcox(Sale Price)"),
+  df %>%
+    ggplot(mapping = aes(sample = boxcox_trans(sale_price))) +
+    stat_qq_point(size = 2, color = "blue") +
+    stat_qq_line(color = "red") +
+    xlab("x-axis") +
+    ylab("y-axis") +
+    ggtitle("Normality Plot"),
+  nrow = 1
+)
+```
+
+Box-cox transformation seems a little bit better. However there are several outliers in `sale_price`. In order to deal with the outliers, percentiles are calculated first.
+
+```{r}
+# quantile of sale price
+quantile(df$sale_price, probs = c(0, 0.005, 0.01, 0.05, 0.95, 0.99, 0.995, 1))
+
+# calculate lower and upper bound based on quantiles
+q1 <- quantile(df$sale_price, probs = 0.25)
+q3 <- quantile(df$sale_price, probs = 0.75)
+iqr <- q3 - q1
+up <- q3 + 1.5 * iqr
+low <- q1 - 1.5 * iqr
+
+print(paste("Lower bound:",low))
+print(paste("Upper bound:",up))
+```
+
+```{r}
+# slice data based on percentiles
+thres1 <- 0.005
+thres2 <- 0.001
+
+df %>% 
+  filter(sale_price<quantile(df$sale_price, probs = thres1)) %>% 
+  nrow()
+
+df %>% 
+  filter(sale_price>quantile(df$sale_price, probs = 1-thres2)) %>% 
+  nrow()
+```
+
+
+
+```{r log trimmed data}
+# plot the distribution of the log trimmed data
+grid.arrange(
+  df %>%
+    filter((
+      sale_price > quantile(df$sale_price, probs = thres1)
+    ) &
+      (
+        sale_price < quantile(df$sale_price, probs = 1-thres2)
+      )) %>%
+    ggplot(aes(x = log1p(sale_price))) +
+    geom_histogram(
+      aes(y = ..density..),
+      
+      colour = 1,
+      fill = "white",
+      bins = 60
+    ) +
+    geom_density(
+      lwd = 1,
+      colour = 4,
+      fill = 4,
+      alpha = 0.25
+    ) +
+    ggtitle("Histogram of log(Sale Price)"),
+  
+  df %>%
+    filter((
+      sale_price > quantile(df$sale_price, probs = thres1)
+    ) &
+      (
+        sale_price < quantile(df$sale_price, probs = 1-thres2)
+      )) %>%
+    ggplot(mapping = aes(sample = log1p(sale_price))) +
+    stat_qq_point(size = 2, color = "blue") +
+    stat_qq_line(color = "red") +
+    xlab("x-axis") +
+    ylab("y-axis") +
+    ggtitle("Normality Plot"),
+  nrow = 1
+)
+```
+
+```{r boxcox trimmed data}
+# plot the distribution of the box-cox transformed trimmed data
+grid.arrange(
+  df %>%
+    filter((
+      sale_price > quantile(df$sale_price, probs = thres1)
+    ) &
+      (
+        sale_price < quantile(df$sale_price, probs = (1-thres2))
+      )) %>%
+    ggplot(aes(x = boxcox_trans(sale_price))) +
+    geom_histogram(
+      aes(y = ..density..),
+      
+      colour = 1,
+      fill = "white",
+      bins = 60
+    ) +
+    geom_density(
+      lwd = 1,
+      colour = 4,
+      fill = 4,
+      alpha = 0.25
+    ) +
+    ggtitle("Histogram of BoxCox(Sale Price)"),
+  
+  df %>%
+    filter((
+      sale_price > quantile(df$sale_price, probs = thres1)
+    ) &
+      (
+        sale_price < quantile(df$sale_price, probs = (1-thres2))
+      )) %>%
+    ggplot(mapping = aes(sample = boxcox_trans(sale_price))) +
+    stat_qq_point(size = 2, color = "blue") +
+    stat_qq_line(color = "red") +
+    xlab("x-axis") +
+    ylab("y-axis") +
+    ggtitle("Normality Plot"),
+  nrow = 1
+)
+```
+
+Both log and box-cox transformation on the trimmed data slightly improves. Therefore, extreme values in `sale_price` are dropped.
+```{r drop outliers in sale_price}
+# drop extreme values in sale_price
+df_clean <- df %>%
+  filter((sale_price > quantile(df$sale_price, probs = thres1)) &
+           (sale_price < quantile(df$sale_price, probs = 1-thres2)))
+```
+
+## NULL Values
+```{r}
+# count NAs and the percentage in each columns
+na_count <- df_clean %>%
+  summarise_all(funs(sum(is.na(.)))) %>%
+  melt() %>%
+  mutate(percent = value / nrow(df_clean) * 100)
+
+# visualize the percentage of missing values in each column
+na_count %>%
+  ggplot(aes(x = variable, y = percent, fill = percent)) +
+  geom_bar(stat = "identity") +
+  geom_hline(yintercept = 20, color = "red") +
+  annotate(
+    "text",
+    x = 52.5,
+    y = 25,
+    size = 3,
+    label = "Columns with more than 20% missing values",
+    color = "red"
+  ) +
+  annotate(
+    "text",
+    x = 52.5,
+    y = 16,
+    size = 3,
+    label = "Columns with less than 20% missing values",
+    color = "limegreen"
+  ) +
+  xlab("Columns") +
+  ylab("Missing value percentage") +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+```{r load codebook for data type}
+# load codebook
+codebook <- read.csv("codebook.csv")
+
+# ind_arms_length in historic data is ind_pure_market in the codebook
+codebook$var_name_standard[codebook$var_name_standard == "ind_pure_market"] <-
+  "ind_arms_length"
+
+# merge variable data type
+dtypes <- codebook %>%
+  dplyr::select(var_name_standard, var_data_type) %>%
+  filter(var_name_standard %in% colnames(df_clean)) %>% distinct()
+
+na_count <-
+  merge(na_count,
+        dtypes,
+        by.x = "variable",
+        by.y = "var_name_standard",
+        sort = F)
+```
+
+6 columns with more than 20% missing values: `meta_cdu`, `char_apts`, `char_tp_plan`, `char_tp_dsgn`, `char_attic_fnsh`, `char_renovation`, and `char_porch`, which are all categorical variables. And most of the missing values also appear in categorical variables. But we will deal it afterwards.
+
+```{r}
+# correlation of columns with missing values ~ sale price
+df_clean %>%
+  dplyr::select(sale_price, na_count[na_count$percent > 3, 'variable']) %>%
+  select_if(is.numeric) %>%
+  cor(use = "complete.obs") %>%
+  corrplot(tl.cex = 0.5, col = colorRampPalette(c("blue4", "white", "brown3"))(100))
+```
+
+Before further analysis of the variables, some descriptive variables without any significance are dropped, including those with a high proportion. Moreover, there are also variables in the dataset sharing similar meanings, for example `geo_municipality` and `geo_property_city` both indicates the city of the property.
+
+```{r drop unnecessary columns}
+# define unnecessary columns
+drop_cols <-
+  c(
+    "meta_cdu",
+    "meta_certified_est_land",
+    "meta_nbhd",
+    "meta_deed_type",
+    "char_apts",
+    "char_hd_sf",
+    "char_tp_dsgn",
+    "char_cnst_qlty",
+    "char_renovation",
+    "char_attic_fnsh",
+    "char_porch",
+    "geo_property_zip",
+    "geo_black_perc",
+    "geo_fips",
+    "geo_asian_perc",
+    "geo_his_perc",
+    "geo_other_perc",
+    "geo_municipality",
+    "geo_fs_flood_risk_direction",
+    "geo_school_elem_district",
+    "geo_school_hs_district",
+    "char_site",
+    # "meta_certified_est_bldg",
+    "char_ot_impr",
+    "geo_property_city",
+    "ind_arms_length"
+  )
+
+df_clean_drop <- df_clean[, !(colnames(df_clean) %in% drop_cols)]
+```
+
+
+# EDA
+## Numeric Variables
+```{r}
+# extract categorical variables
+na_count_drop <- na_count %>%
+  filter(!variable %in% drop_cols)
+```
+
+```{r correlation}
+df_clean_drop %>%
+  dplyr::select(sale_price, na_count_drop[na_count_drop$var_data_type ==
+                                            "numeric", "variable"]) %>%
+  # select_if(is.numeric) %>%
+  cor(use = "complete.obs") %>%
+  corrplot(tl.cex = 0.5, col = colorRampPalette(c("blue4", "white", "brown3"))(100))
+```
+
+Estimated market value (`meta_certified_est_bldg`) is highly correlated with actual sale price, as well as building square feet (`char_bldg_sf`) and median income （`econ_midincome`).
+
+```{r building sf}
+# scatter plot of building sf ~ sale price
+df_clean %>%
+  ggplot(aes(
+    x = char_bldg_sf,
+    y = boxcox_trans(sale_price),
+    color = boxcox_trans(sale_price)
+  )) +
+  geom_point(alpha = 0.4) +
+  scale_color_distiller(palette = "Blues", direction = 1)
+```
+
+```{r midincome}
+# scatter plot of median income ~ sale price
+df_clean %>%
+  dplyr::select(sale_price, na_count_drop[na_count_drop$var_data_type ==
+                                            "numeric", "variable"]) %>%
+  ggplot(aes(
+    x = econ_midincome,
+    y = boxcox_trans(sale_price),
+    color = boxcox_trans(sale_price)
+  )) +
+  geom_point(alpha = 0.4) +
+  scale_color_distiller(palette = "Blues", direction = 1)
+```
+
+```{r white percent}
+# scatter plot of median income ~ sale price
+df_clean %>%
+  dplyr::select(sale_price, na_count_drop[na_count_drop$var_data_type ==
+                                            "numeric", "variable"]) %>%
+  ggplot(aes(
+    x = geo_white_perc,
+    y = boxcox_trans(sale_price),
+    color = boxcox_trans(sale_price)
+  )) +
+  geom_point(alpha = 0.4) +
+  scale_color_distiller(palette = "Blues", direction = 1)
+```
+
+There are 157 entries without geographic and economic information. Since it is a very proportion, we consider dropping those observations.
+```{r drop geo missing}
+# drop missing values in geo
+df_clean_drop <- df_clean_drop %>%
+  drop_na(econ_midincome)
+```
+
+
+```{r fire place}
+# plot the distribution of fire place
+grid.arrange(
+  df_clean_drop %>%
+    mutate(char_frpl = as.factor(char_frpl)) %>%
+    ggplot(aes(
+      x = char_frpl,
+      y = boxcox_trans(sale_price),
+      fill = char_frpl
+    )) +
+    geom_boxplot() +
+    theme(legend.position = "none"),
+  
+  df_clean_drop %>%
+    mutate(char_frpl = as.factor(char_frpl)) %>%
+    ggplot(aes(x = char_frpl, fill = char_frpl)) +
+    geom_bar() +
+    theme(legend.position = "none"),
+  nrow = 1
+)
+```
+
+For most properties, no fireplace is observed and sale price is positively associated with sale price. In this case, we treat the misisng values as 0.
+```{r}
+df_clean_drop <-
+  df_clean_drop %>%
+  mutate_at(vars(char_frpl), ~ replace(., is.na(.), 0))
+```
+
+
+## Categorical Variables
+```{r convert to factors}
+# transform categorical variables into factors
+cat_cols <-
+  na_count_drop[na_count_drop$var_data_type %in% c("character", "categorical"), "variable"]
+df_clean_drop <- df_clean_drop %>%
+  mutate(across(cat_cols, factor))
+```
+
+```{r town}
+# count number of properties in each town
+df_clean_drop %>%
+  ggplot(aes(x = meta_town_code, fill = ..count..)) +
+  geom_bar() +
+  scale_fill_gradientn(colours = (brewer.pal(9, "Blues")[5:9])) +
+  ggtitle("Most Frequent Town")
+
+```
+
+```{r garage}
+# plot garage-related variables
+grid.arrange(
+  df_clean_drop %>%
+    ggplot(aes(x = ind_garage, fill = ind_garage)) +
+    geom_bar() +
+    theme(legend.position = "none"),
+  # if the property has a garage or not
+  df_clean_drop %>%
+    ggplot(aes(
+      x = ind_garage,
+      y = boxcox_trans(sale_price),
+      fill = ind_garage
+    )) +
+    geom_boxplot() +
+    theme(legend.position = "none"),
+  df_clean_drop %>%
+    ggplot(aes(x = char_gar1_size, fill = char_gar1_size)) +
+    geom_bar() +
+    theme(legend.position = "none"),
+  df_clean_drop %>%
+    ggplot(aes(
+      x = char_gar1_size,
+      y = boxcox_trans(sale_price),
+      fill = char_gar1_size
+    )) +
+    geom_boxplot() +
+    theme(legend.position = "none"),
+  nrow = 2
+)
+
+```
+
+The majority of properties has a garage. 2 cars is the most common size for garage 1 size, and property sale price slightly varies by garage size. Properties with missing garage 1 size have a similar average sale price as those with a 2-car garage 1. 
+
+Therefore, as for the 18 missing values, we will assume they have a 2-car garage.
+
+```{r fill garage}
+# fill missing values in garage
+df_clean_drop <- df_clean_drop %>%
+  mutate_at(vars(ind_garage), ~ replace(., is.na(.), TRUE)) %>%
+  mutate_at(vars(char_gar1_size), ~ replace(., is.na(.), 3))
+```
+
+
+```{r}
+# updated NA counts
+df_clean_drop %>%
+  summarise_all(funs(sum(is.na(.)))) %>%
+  melt() %>%
+  mutate(percent = value / nrow(df_clean_drop) * 100) %>%
+  merge(dtypes,
+        by.x = "variable",
+        by.y = "var_name_standard",
+        sort = F) %>%
+  filter(var_data_type != "numeric")
+```
+
+```{r house condition}
+# plot building-related variables
+grid.arrange(
+  df_clean_drop %>%
+    ggplot(aes(x = char_air, fill = char_air)) +
+    geom_bar() +
+    ggtitle("Central Air Conditioning") +
+    theme(legend.position = "none"),
+  
+  df_clean_drop %>%
+    ggplot(aes(x = char_ext_wall, fill = char_ext_wall)) +
+    geom_bar() +
+    ggtitle("Wall Material") +
+    theme(legend.position = "none"),
+  
+  df_clean_drop %>%
+    ggplot(aes(x = char_bsmt, fill = char_bsmt)) +
+    geom_bar() +
+    ggtitle("Basement") +
+    theme(legend.position = "none"),
+  
+  df_clean_drop %>%
+    ggplot(aes(x = char_roof_cnst, fill = char_roof_cnst)) +
+    geom_bar() +
+    ggtitle("Roof Material") +
+    theme(legend.position = "none"),
+  nrow = 2
+)
+
+```
+
+Drop missing value in `char_ext_wall`, `char_air`, since we can not infer from the underlying distribution.
+```{r}
+# drop NAs
+df_clean_drop <- df_clean_drop %>%
+  drop_na(char_ext_wall, char_air) 
+```
+
+Meanwhile, roof material is dominated by 1 (Shingle + Asphalt), and a large number of other categorical variables have a dominant value. In this typical analysis, they are considered "nonsense" because they have a dominant value that covers a high percentage of the dataset.
+
+```{r nonsense check}
+# define a function to calculate mode
+calc_mode <- function(x) {
+  # List the distinct / unique values
+  distinct_values <- unique(x)
+  # Count the occurrence of each distinct value
+  distinct_tabulate <- tabulate(match(x, distinct_values))
+  # Return the value with the highest occurrence
+  return(distinct_values[which.max(distinct_tabulate)])
+}
+
+# calculate the percentage of coverage of dominant values
+dominate_percent <- df_clean_drop %>%
+  summarise(across(cat_cols, ~ {
+    mode <- calc_mode(.[!is.na(.)])
+    sum(. == mode, na.rm = TRUE) / sum(!is.na(.)) * 100
+  })) %>%
+  melt()
+colnames(dominate_percent) <- c("variable", "percent")
+
+dominate_percent %>% arrange(desc(percent))
+```
+
+Features with a high-coverage dominant value are dropped (>60%).
+```{r}
+nonsense_cols <-
+  dominate_percent[dominate_percent$percent > 60, "variable"]
+df_clean_drop <-
+  df_clean_drop[, !(colnames(df_clean_drop) %in% nonsense_cols)]
+```
+
+```{r}
+# update NA counts
+df_clean_drop %>%
+  summarise_all(funs(sum(is.na(.)))) %>%
+  melt() %>%
+  mutate(percent = value / nrow(df_clean_drop) * 100) %>%
+  merge(dtypes,
+        by.x = "variable",
+        by.y = "var_name_standard",
+        sort = F)
+```
+
+# Feature Engineering
+## Feature Creation
+```{r ind_apt}
+# class 211 and 212 are apartments
+df_clean_drop$ind_apt <-
+  ifelse(df_clean_drop$meta_class %in% c("211", "212"), TRUE, FALSE)
+# drop meta_class
+df_clean_drop <- df_clean_drop %>%
+  dplyr::select(-meta_class)
+```
+
+```{r bath}
+# total bath = full + 0.5*half
+df_clean_drop$char_bath <-
+  df_clean_drop$char_fbath + 0.5 * df_clean_drop$char_hbath
+
+# drop full bath and half bath
+df_clean_drop <- df_clean_drop %>%
+  dplyr::select(-char_fbath, -char_hbath)
+```
+
+## Split data
+```{r split data}
+set.seed(123)
+train_id <-
+  createDataPartition(y = df_clean_drop$sale_price,
+                      p = 0.7,
+                      list = FALSE)
+
+train <- df_clean_drop[train_id, ]
+test <- df_clean_drop[-train_id, ]
+```
+
+# Modeling
+
+In the modeling part, original `sale_price` is used because transformed values does not help improve model performance significantly.
+
+## Baseline Model -Linear Regression
+```{r linear regression}
+# fit linear regression with all variables
+lr <- lm((sale_price) ~ ., data = train)
+summary(lr)
+```
+
+Drop less significant variables based on linear regression results.
+```{r drop insignificant columns}
+insig_cols <- c("ind_garage", "geo_tract_pop")
+
+train_drop <- train[, !(colnames(train) %in% insig_cols)]
+test_drop <- test[, !(colnames(test) %in% insig_cols)]
+
+X_train <- model.matrix(sale_price ~ ., train_drop)[, -1]
+X_test <- model.matrix(sale_price ~ ., test_drop)[, -1]
+y_train <- train$sale_price
+y_test <- test$sale_price
+```
+
+```{r}
+lr_new <- lm((sale_price) ~ ., data = train)
+pred_lr <- predict(lr_new, newdata = test)
+mse_lr <- mean(((pred_lr) - y_test) ^ 2)
+
+print(paste("Baseline model MSE:", mse_lr))
+```
+
+
+## Fine Tune Models
+```{r}
+control <- trainControl(method = "cv", number = 10)
+metric <- "RMSE"
+
+# start paralell processing
+cluster <-
+  makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+```
+
+### Lasso Regression
+```{r lasso}
+lasso <-
+  train(
+    X_train,
+    y_train,
+    method = 'glmnet',
+    trControl = control,
+    metric = metric,
+    tuneGrid = expand.grid(
+      alpha = 1,
+      lambda = c(0.001, 0.01, 0.1, 1, 10, 100, 1000)
+    )
+  )
+
+print(paste("Optimal lambda:", lasso$bestTune$lambda))
+
+# make predictions
+pred_lasso <- predict(lasso, newdata = X_test)
+
+# calculate mse
+mse_lasso <- mean(((pred_lasso) - y_test) ^ 2)
+print(paste("Lasso MSE:", mse_lasso))
+```
+
+### GBM
+```{r gbm}
+# fine tune GBM model
+gbm <-
+  train(
+    X_train,
+    y_train,
+    method = "gbm",
+    trControl = control,
+    verbose = FALSE
+  )
+gbm$bestTune
+
+# make predictions
+pred_gbm <- predict(gbm, newdata = X_test)
+
+# calculate mse
+mse_gbm <- mean(((pred_gbm) - y_test) ^ 2)
+print(paste("GBM MSE:", mse_gbm))
+
+# n.trees -150
+# interaction.depth -3
+# shrinkage -0.1
+# n.minobsinnode -10
+```
+
+GBM MSE: 19559770691.9826
+
+### Random Forest
+```{r}
+# possible values of mtry
+floor(log2(ncol(X_train)))
+floor(sqrt(ncol(X_train)))
+floor(ncol(X_train) / 3)
+```
+
+Fine tuning random forest with `caret` package takes too long. So random forest model is fine tuned manually.
+```{r rf-tune}
+# rf <- train(X_train, y_train,
+#       method = "ranger",
+#       importance = "impurity",
+#       trControl = control)
+```
+
+```{r rf-manual}
+# manually fine tune random forest model
+mtry_values <- c(6, 8, 16)
+ntree_values <- c(500, 1000, 1500)
+
+rf_results <- data.frame(mtry = integer(),
+                         ntree = integer(),
+                         mse = numeric())
+
+for (mtry in mtry_values) {
+  for (ntree in ntree_values) {
+    rf_tmp <- ranger(
+      sale_price ~ .,
+      data = train_drop,
+      num.trees = ntree,
+      # Number of trees (default is 500)
+      mtry = mtry,
+      # Number of variables tried at each split
+      importance = 'impurity',
+      # Variable importance (can be 'none', 'impurity', or 'permutation')
+    )
+    mse_tmp <-
+      mean((predict(rf_tmp, test_drop)$predictions - y_test) ^ 2)
+    
+    rf_results <-
+      rbind(rf_results,
+            data.frame(
+              mtry = mtry,
+              ntree = ntree,
+              mse = mse_tmp
+            ))
+  }
+}
+
+mse_rf <- min(rf_results$mse)
+rf_results[which.min(rf_results$mse), ]
+
+# mtry=6, ntree=1000
+```
+
+```{r rf-final}
+# fit random forest
+rf <- ranger(
+  sale_price ~ .,
+  data = train_drop,
+  num.trees = rf_results[which.min(rf_results$mse), ]$ntree,
+  mtry = rf_results[which.min(rf_results$mse), ]$mtry,
+  importance = 'impurity',
+)
+```
+
+```{r feature imp}
+# evaluate variable importance
+enframe(rf$variable.importance,
+        name = "variable",
+        value = "importance") %>%
+  filter(variable != "meta_certified_est_bldg") %>%
+  ggplot(aes(
+    x = reorder(variable, importance),
+    y = importance,
+    fill = importance
+  )) +
+  geom_bar(stat = "identity", position = "dodge") +
+  coord_flip() +
+  ylab("Variable Importance") +
+  xlab("") +
+  ggtitle("Information Value Summary") +
+  guides(fill = "none") +
+  scale_fill_gradientn(colours = (brewer.pal(9, "Blues")[4:9]))
+```
+
+### LightGBM
+```{r}
+# define a recipe for preprocessing
+recipe <- recipe(sale_price ~ ., data = train_drop) %>%
+  step_zv(all_predictors())
+
+# model definition
+lightgbm_spec <- boost_tree(
+  mode = "regression",
+  trees = 1000,
+  learn_rate = tune(),
+  mtry = 6,
+  tree_depth = tune(),
+  min_n = tune()
+) %>%
+  set_engine("lightgbm", seed = 123)
+
+# workflow
+lightgbm_wf <- workflow() %>%
+  add_model(lightgbm_spec) %>%
+  add_recipe(recipe)
+
+lightgbm_wf
+```
+
+```{r}
+# hyperparameter tunning
+cv_folds <- vfold_cv(train, v = 5, strata = sale_price)
+
+lightgbm_grid <- parameters(lightgbm_spec) %>% 
+    finalize(train) %>% 
+    grid_random(size = 200)
+
+head(lightgbm_grid)
+```
+
+```{r}
+# grid search
+tune_res <- lightgbm_wf %>%
+  tune_grid(
+    resamples = cv_folds,
+    grid = lightgbm_grid,
+    control = control_grid(verbose = FALSE),
+    metrics = metric_set(rmse)
+  )
+
+# show_notes(.Last.tune.result)
+
+best_params <- select_best(tune_res, "rmse")
+best_params
+```
+
+
+```{r}
+autoplot(tune_res)
+```
+
+```{r}
+# select best hyperparameter found
+final_wf <- lightgbm_wf %>% finalize_workflow(best_params)
+
+# fit final lightgbm model
+final_model <- final_wf %>% fit(data = train)
+
+# make predictions
+pred_lightgbm <- final_model %>%
+  predict(new_data = test)
+
+# calculate mse
+mse_lightgbm <- mean((pred_lightgbm$.pred - y_test) ^ 2)
+print(paste("LightGBM MSE:", mse_lightgbm))
+```
+
+## Model Comparison
+```{r}
+data.frame(
+  model = c("Linear Regression", "Lasso Regression", "RF", "GBM", "LightGBM"),
+  MSE = c(mse_lr, mse_lasso, mse_rf, mse_gbm, mse_lightgbm)
+)
+```
+
+# Predict Property Sale Prices
+```{r read assessment data}
+assess <- read.csv("predict_property_data.csv")
+head(assess)
+```
+
+## Data Preprocessing
+```{r}
+# create new features select feature columns from assessment dataset
+new <- assess %>%
+  mutate(
+    ind_apt = ifelse(meta_class %in% c("211", "212"), TRUE, FALSE),
+    char_bath = char_fbath + 0.5 * char_hbath
+  ) %>%
+  dplyr::select(colnames(train[,-1]))
+
+# factorize categorical features
+new <- new %>%
+  mutate(across(colnames(new)[colnames(new) %in% cat_cols], factor))
+```
+
+
+```{r missing value in assess}
+# count missing values in the prediction dataset
+new %>% summarise_all(funs(sum(is.na(.)))) %>%
+  melt() %>%
+  mutate(percent = value / nrow(new) * 100) 
+```
+
+```{r fill missing with mode}
+# fill NA with mode
+new_filled <- new %>%
+  mutate(across(everything(), ~ replace_na(.x, calc_mode(.x))))
+```
+
+## Prediction
+```{r assess values}
+assess_lightgbm <- final_model %>%
+  predict(new_data = new_filled)
+
+assess_rf <- predict(rf, new_filled)$pred
+```
+
+```{r}
+# weighted average of the two assessment
+w_lightgbm <- 0.75
+
+assess_final <-
+  w_lightgbm * assess_lightgbm + (1 - w_lightgbm) * assess_rf
+
+assess_final %>% summary()
+```
+```{r}
+assess_final %>% 
+ggplot(aes(x = .pred))+
+    geom_histogram(
+      aes(y = ..density..),
+      
+      colour = 1,
+      fill = "white",
+      bins = 60
+    ) +
+    geom_density(
+      lwd = 1,
+      colour = 4,
+      fill = 4,
+      alpha = 0.25
+    ) +
+    xlab("Prediction") +
+    ggtitle("Histogram of Preidcted Sale Price")
+```
+
+```{r export assessment}
+data.frame(pid = assess$pid,
+           assessed_value = assess_final) %>%
+  write.csv("assessed_value.csv", row.names = FALSE)
+```
+
+```{r}
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+```{r include=FALSE}
+end_time <- Sys.time()
+end_time - start_time
+```
+
+
